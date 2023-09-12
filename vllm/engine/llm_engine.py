@@ -371,6 +371,11 @@ class LLMEngine:
                 self.scheduler.free_seq(parent)
                 continue
             # Fork the parent sequence if there are multiple child samples.
+            if child_samples[0].prompt_logprobs is not None:
+                assert all(s.prompt_logprobs is not None for s in child_samples)
+                parent.set_prompt_logprobs(child_samples[0].prompt_logprobs)
+            else:
+                assert all(s.prompt_logprobs is None for s in child_samples)
             for child_sample in child_samples[:-1]:
                 new_child_seq_id = next(self.seq_counter)
                 child = parent.fork(new_child_seq_id)

@@ -101,6 +101,8 @@ class Sequence:
             block size used by the block manager and cache engine.
     """
 
+    prompt_logprobs: Optional[List[float]]
+
     def __init__(
         self,
         seq_id: int,
@@ -121,6 +123,7 @@ class Sequence:
         # Initialize the logical token blocks with the prompt token ids.
         self._append_tokens_to_blocks(prompt_token_ids)
         self.status = SequenceStatus.WAITING
+        self.prompt_logprobs = None
 
     def _append_logical_block(self) -> None:
         block = LogicalTokenBlock(
@@ -194,6 +197,11 @@ class Sequence:
                     and self.get_last_token_id() == eos_token_id):
                 seq_len -= 1
         return self.get_cumulative_logprob() / (seq_len**length_penalty)
+
+    def set_prompt_logprobs(self, prompt_logprobs: List[float]) -> None:
+        assert self.prompt_logprobs is None
+        assert len(prompt_logprobs) == self.get_prompt_len()
+        self.prompt_logprobs = copy.deepcopy(prompt_logprobs)
 
     def is_finished(self) -> bool:
         return SequenceStatus.is_finished(self.status)
@@ -333,22 +341,26 @@ class SequenceOutputs:
         parent_seq_id: int,
         output_token: int,
         logprobs: Dict[int, float],
+        prompt_logprobs: Optional[List[float]],
     ) -> None:
         self.parent_seq_id = parent_seq_id
         self.output_token = output_token
         self.logprobs = logprobs
+        self.prompt_logprobs = prompt_logprobs
 
     def __repr__(self) -> str:
         return (f"SequenceOutputs(parent_seq_id={self.parent_seq_id}, "
                 f"output_token={self.output_token}), "
-                f"logprobs={self.logprobs}")
+                f"logprobs={self.logprobs}, "
+                f"prompt_logprobs={self.prompt_logprobs})")
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, SequenceOutputs):
             return NotImplementedError()
         return (self.parent_seq_id == other.parent_seq_id
                 and self.output_token == other.output_token
-                and self.logprobs == other.logprobs)
+                and self.logprobs == other.logprobs
+                and self.prompt_logprobs == other.prompt_logprobs)
 
 
 # For each sequence group, we generate a list of SequenceOutputs object,

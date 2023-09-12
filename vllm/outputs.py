@@ -61,12 +61,14 @@ class RequestOutput:
         request_id: str,
         prompt: str,
         prompt_token_ids: List[int],
+        prompt_logprobs: Optional[List[float]],
         outputs: List[CompletionOutput],
         finished: bool,
     ) -> None:
         self.request_id = request_id
         self.prompt = prompt
         self.prompt_token_ids = prompt_token_ids
+        self.prompt_logprobs = prompt_logprobs
         self.outputs = outputs
         self.finished = finished
 
@@ -102,13 +104,15 @@ class RequestOutput:
         # Every sequence in the sequence group should have the same prompt.
         prompt = top_n_seqs[0].prompt
         prompt_token_ids = top_n_seqs[0].data.prompt_token_ids
+        prompt_logprobs = top_n_seqs[0].prompt_logprobs
         finished = seq_group.is_finished()
-        return cls(seq_group.request_id, prompt, prompt_token_ids, outputs,
-                   finished)
+        return cls(seq_group.request_id, prompt, prompt_token_ids, prompt_logprobs,
+                   outputs, finished)
 
     def __repr__(self) -> str:
         return (f"RequestOutput(request_id={self.request_id}, "
                 f"prompt={self.prompt!r}, "
                 f"prompt_token_ids={self.prompt_token_ids}, "
+                f"prompt_logprobs={self.prompt_logprobs}, "
                 f"outputs={self.outputs}, "
                 f"finished={self.finished})")

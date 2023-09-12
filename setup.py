@@ -79,7 +79,7 @@ if not compute_capabilities:
         compute_capabilities.add(90)
 
 # Add target compute capabilities to NVCC flags.
-for capability in compute_capabilities:
+for capability in {70, 75, 80, 86, 89, 90}:
     NVCC_FLAGS += [
         "-gencode", f"arch=compute_{capability},code=sm_{capability}"
     ]
