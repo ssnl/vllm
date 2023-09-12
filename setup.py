@@ -2,6 +2,7 @@ import io
 import os
 import re
 import subprocess
+import copy
 from typing import List, Set
 
 from packaging.version import parse, Version
@@ -79,10 +80,16 @@ if not compute_capabilities:
         compute_capabilities.add(90)
 
 # Add target compute capabilities to NVCC flags.
+QUANT_NVCC_FLAGS = copy.deepcopy(NVCC_FLAGS)
 for capability in {70, 75, 80, 86, 89, 90}:
     NVCC_FLAGS += [
         "-gencode", f"arch=compute_{capability},code=sm_{capability}"
     ]
+    if capability >= 80:
+        # awq needs ampere
+        QUANT_NVCC_FLAGS += [
+            "-gencode", f"arch=compute_{capability},code=sm_{capability}"
+        ]
 
 # Use NVCC threads to parallelize the build.
 if nvcc_cuda_version >= Version("11.2"):
@@ -117,7 +124,7 @@ ext_modules.append(attention_extension)
 quantization_extension = CUDAExtension(
     name="vllm.quantization_ops",
     sources=["csrc/quantization.cpp", "csrc/quantization/quantization_kernels.cu"],
-    extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
+    extra_compile_args={"cxx": CXX_FLAGS, "nvcc": QUANT_NVCC_FLAGS},
 )
 ext_modules.append(quantization_extension)
 
