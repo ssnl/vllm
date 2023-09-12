@@ -11,6 +11,40 @@ logger = init_logger(__name__)
 
 _GB = 1 << 30
 
+_ALLOWED_QUANTIZATION_METHODS = ["awq"]
+_ALLOWED_QUANTIZATION_BITWIDTHS = [4]
+_AWQ_DTYPE_BITWIDTH = 32
+
+
+class WeightQuantizationConfig:
+    """Weight Quantization settings
+
+    Args:
+        method: The quantization method to apply
+        bits: How many bits the linear layer weights are quantized to
+        group_size: What size the weights were quantized in groups of
+    """
+
+    def __init__(self,
+                 method: str,
+                 w_bit: Optional[int] = 4,
+                 group_size: Optional[int] = 128) -> None:
+        self.method = method
+        self.w_bit = w_bit
+        self.group_size = group_size
+        self.pack_factor = _AWQ_DTYPE_BITWIDTH // w_bit
+        self._verify()
+
+    def _verify(self) -> None:
+        if self.method not in _ALLOWED_QUANTIZATION_METHODS:
+            raise ValueError(
+                f"Unknown quantization method ({self.method})"
+                f" must be from choice of {_ALLOWED_QUANTIZATION_METHODS}")
+        if self.w_bit not in _ALLOWED_QUANTIZATION_BITWIDTHS:
+            raise ValueError(
+                f"Invalid w_bit ({self.w_bit})"
+                f" must be from choice of {_ALLOWED_QUANTIZATION_BITWIDTHS}")
+
 
 class ModelConfig:
     """Configuration for the model.
@@ -38,6 +72,7 @@ class ModelConfig:
             will use FP16 precision for FP32 and FP16 models, and BF16 precision
             for BF16 models.
         seed: Random seed for reproducibility.
+        quantization_config: Optional quantization settings
     """
 
     def __init__(
@@ -50,6 +85,7 @@ class ModelConfig:
         load_format: str,
         dtype: str,
         seed: int,
+        quantization_config: Optional[WeightQuantizationConfig] = None
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -58,6 +94,7 @@ class ModelConfig:
         self.download_dir = download_dir
         self.load_format = load_format
         self.seed = seed
+        self.quantization_config = quantization_config
 
         self.hf_config = get_config(model, trust_remote_code)
         self.dtype = _get_and_verify_dtype(self.hf_config, dtype)
@@ -156,6 +193,13 @@ class ModelConfig:
     def get_num_layers(self, parallel_config: "ParallelConfig") -> int:
         total_num_hidden_layers = self.hf_config.num_hidden_layers
         return total_num_hidden_layers // parallel_config.pipeline_parallel_size
+
+    def get_quantization_method(self):
+        if self.quantization_config is None:
+            method = None
+        else:
+            method = self.quantization_config.method
+        return method
 
 
 class CacheConfig:

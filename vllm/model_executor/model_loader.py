@@ -30,6 +30,11 @@ _MODEL_REGISTRY = {
     "RWForCausalLM": FalconForCausalLM,
 }
 
+_MODEL_CLASSES_SUPPORT_QUANTIZATION = [
+    LlamaForCausalLM,
+    MPTForCausalLM,
+]
+
 
 @contextlib.contextmanager
 def _set_default_torch_dtype(dtype: torch.dtype):
@@ -50,12 +55,17 @@ def _get_model_architecture(config: PretrainedConfig) -> Type[nn.Module]:
         f"Supported architectures: {list(_MODEL_REGISTRY.keys())}")
 
 
+def _supports_quantization(model_class):
+    return model_class in _MODEL_CLASSES_SUPPORT_QUANTIZATION
+
+
 def get_model(model_config: ModelConfig) -> nn.Module:
     model_class = _get_model_architecture(model_config.hf_config)
     with _set_default_torch_dtype(model_config.dtype):
         # Create a model instance.
         # The weights will be initialized as empty tensors.
-        model = model_class(model_config.hf_config)
+        model = model_class(model_config.hf_config,
+                            model_config.quantization_config)
         if model_config.load_format == "dummy":
             model = model.cuda()
             # NOTE(woosuk): For accurate performance evaluation, we assign

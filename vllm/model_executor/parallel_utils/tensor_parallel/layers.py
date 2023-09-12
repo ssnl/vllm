@@ -1,3 +1,4 @@
+
 # Copyright 2023 The vLLM team.
 # Adapted from https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/layers.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
@@ -11,6 +12,7 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn.parameter import Parameter
 
+from vllm.model_executor.layers.quantized_linear import awq_linear
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -239,6 +241,7 @@ class ColumnParallelLinear(torch.nn.Module):
                  params_dtype=None,
                  use_cpu_initialization=False,
                  perform_initialization=True,
+                 quant_config=None,
                  ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -250,30 +253,52 @@ class ColumnParallelLinear(torch.nn.Module):
         self.world_size = get_tensor_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, self.world_size)
         self.skip_bias_add = skip_bias_add
+        self.quant_config = quant_config
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
-        # Parameters.
-        # Note: torch.nn.functional.linear performs XA^T + b and as a result
-        # we allocate the transpose.
-        # Initialize weight.
-        if use_cpu_initialization:
-            self.weight = Parameter(torch.empty(self.output_size_per_partition,
-                                                self.input_size,
-                                                dtype=params_dtype))
-            if perform_initialization:
-                self.master_weight = _initialize_affine_weight_cpu(
-                    self.weight, self.output_size, self.input_size,
-                    self.output_size_per_partition, 0, init_method,
-                    stride=stride, return_master_weight=keep_master_weight_for_test)
+        if self.quant_config is None:
+            # Parameters.
+            # Note: torch.nn.functional.linear performs XA^T + b and as a result
+            # we allocate the transpose.
+            # Initialize weight.
+            if use_cpu_initialization:
+                self.weight = Parameter(torch.empty(self.output_size_per_partition,
+                                                    self.input_size,
+                                                    dtype=params_dtype))
+                if perform_initialization:
+                    self.master_weight = _initialize_affine_weight_cpu(
+                        self.weight, self.output_size, self.input_size,
+                        self.output_size_per_partition, 0, init_method,
+                        stride=stride, return_master_weight=keep_master_weight_for_test)
+            else:
+                self.weight = Parameter(torch.empty(
+                    self.output_size_per_partition, self.input_size,
+                    device=torch.cuda.current_device(), dtype=params_dtype))
+                if perform_initialization:
+                    _initialize_affine_weight_gpu(self.weight, init_method,
+                                                  partition_dim=0, stride=stride)
+            self.register_parameter('qweight', None)
+            self.register_parameter('qzeros', None)
+            self.register_parameter('scales', None)
         else:
-            self.weight = Parameter(torch.empty(
-                self.output_size_per_partition, self.input_size,
-                device=torch.cuda.current_device(), dtype=params_dtype))
-            if perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, init_method,
-                                              partition_dim=0, stride=stride)
+            # Quantized parameters.
+            assert self.input_size % self.quant_config.w_bit == 0
+            assert self.output_size_per_partition % self.quant_config.pack_factor == 0
+            self.qweight = Parameter(torch.empty(
+                self.input_size,
+                self.output_size_per_partition // self.quant_config.pack_factor,
+                device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+            self.qzeros = Parameter(torch.empty(
+                self.input_size // self.quant_config.group_size,
+                self.output_size_per_partition // self.quant_config.pack_factor,
+                device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+            self.scales = Parameter(torch.empty(
+                self.input_size // self.quant_config.group_size,
+                self.output_size_per_partition,
+                device=torch.cuda.current_device(), dtype=params_dtype), requires_grad=False)
+            self.register_parameter('weight', None)
 
         if bias:
             if use_cpu_initialization:
@@ -305,8 +330,13 @@ class ColumnParallelLinear(torch.nn.Module):
         bias = self.bias if not self.skip_bias_add else None
 
         input_parallel = input_
+
         # Matrix multiply.
-        output_parallel = F.linear(input_parallel, self.weight, bias)
+        if self.quant_config and self.quant_config.method == "awq":
+            output_parallel = awq_linear(input_parallel, self.qweight, self.scales, self.qzeros, bias, pack_factor=self.quant_config.pack_factor)
+        else:
+            output_parallel = F.linear(input_parallel, self.weight, bias)
+
         if self.gather_output:
             # All-gather across the partitions.
             output = gather_from_tensor_model_parallel_region(output_parallel)
@@ -361,6 +391,7 @@ class RowParallelLinear(torch.nn.Module):
                  use_cpu_initialization=False,
                  perform_initialization=True,
                  reduce_results=True,
+                 quant_config=None,
                  ):
         super(RowParallelLinear, self).__init__()
 
@@ -376,32 +407,54 @@ class RowParallelLinear(torch.nn.Module):
         self.world_size = get_tensor_model_parallel_world_size()
         self.input_size_per_partition = divide(input_size, self.world_size)
         self.skip_bias_add = skip_bias_add
+        self.quant_config = quant_config
+
+        if self.quant_config is None:
+            # Parameters.
+            # Note: torch.nn.functional.linear performs XA^T + b and as a result
+            # we allocate the transpose.
+            # Initialize weight.
+            if use_cpu_initialization:
+                self.weight = Parameter(torch.empty(self.output_size,
+                                                    self.input_size_per_partition,
+                                                    dtype=params_dtype))
+                if perform_initialization:
+                    self.master_weight = _initialize_affine_weight_cpu(
+                        self.weight, self.output_size, self.input_size,
+                        self.input_size_per_partition, 1, init_method,
+                        stride=stride, return_master_weight=keep_master_weight_for_test)
+            else:
+                self.weight = Parameter(torch.empty(
+                    self.output_size, self.input_size_per_partition,
+                    device=torch.cuda.current_device(), dtype=params_dtype))
+                if perform_initialization:
+                    _initialize_affine_weight_gpu(self.weight, init_method,
+                                                  partition_dim=1, stride=stride)
+            self.register_parameter('qweight', None)
+            self.register_parameter('qzeros', None)
+            self.register_parameter('scales', None)
+        else:
+            # Quantized parameters.
+            assert self.input_size_per_partition % self.quant_config.w_bit == 0
+            assert self.output_size % self.quant_config.pack_factor == 0
+            self.qweight = Parameter(torch.empty(
+                self.input_size_per_partition,
+                self.output_size // self.quant_config.pack_factor,
+                device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+            self.qzeros = Parameter(torch.empty(
+                self.input_size_per_partition // self.quant_config.group_size,
+                self.output_size // self.quant_config.pack_factor,
+                device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+            self.scales = Parameter(torch.empty(
+                self.input_size_per_partition // self.quant_config.group_size,
+                self.output_size,
+                device=torch.cuda.current_device(), dtype=params_dtype), requires_grad=False)
+            self.register_parameter('weight', None)
 
         if not reduce_results and (bias and not skip_bias_add):
             raise ValueError("When not reduce the results, adding bias to the "
                              "results can lead to incorrect results")
 
-        # Parameters.
-        # Note: torch.nn.functional.linear performs XA^T + b and as a result
-        # we allocate the transpose.
-        # Initialize weight.
-        if use_cpu_initialization:
-            self.weight = Parameter(torch.empty(self.output_size,
-                                                self.input_size_per_partition,
-                                                dtype=params_dtype))
-            if perform_initialization:
-                self.master_weight = _initialize_affine_weight_cpu(
-                    self.weight, self.output_size, self.input_size,
-                    self.input_size_per_partition, 1, init_method,
-                    stride=stride, return_master_weight=keep_master_weight_for_test,
-                    params_dtype=params_dtype)
-        else:
-            self.weight = Parameter(torch.empty(
-                self.output_size, self.input_size_per_partition,
-                device=torch.cuda.current_device(), dtype=params_dtype))
-            if perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, init_method,
-                                              partition_dim=1, stride=stride)
         if bias:
             if use_cpu_initialization:
                 self.bias = Parameter(torch.empty(self.output_size,
@@ -416,7 +469,6 @@ class RowParallelLinear(torch.nn.Module):
                 self.bias.zero_()
         else:
             self.register_parameter('bias', None)
-        self.weight_t = self.weight.t()
 
     def forward(self, input_):
         """Forward of RowParallelLinear
@@ -433,8 +485,13 @@ class RowParallelLinear(torch.nn.Module):
             input_parallel = input_
         else:
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
+
         # Matrix multiply.
-        output_parallel = F.linear(input_parallel, self.weight)
+        if self.quant_config and self.quant_config.method == "awq":
+            output_parallel = awq_linear(input_parallel, self.qweight, self.scales, self.qzeros, pack_factor=self.quant_config.pack_factor)
+        else:
+            output_parallel = F.linear(input_parallel, self.weight)
+
         if self.reduce_results and self.world_size > 1:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         else:

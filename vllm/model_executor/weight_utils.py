@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from vllm.config import WeightQuantizationConfig
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -22,6 +23,27 @@ class Disabledtqdm(tqdm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, disable=True)
 
+
+def is_transposed(param_name,
+                  quant_config: Optional[WeightQuantizationConfig] = None):
+    """Returns True if the parameter tensor given by state_dict[param_name] is
+    transposed relative to torch.nn.Linear.weight. Otherwise, returns False.
+    """
+    if quant_config and quant_config.method == "awq":
+        return any(tag in param_name
+                   for tag in ["qweight", "scales", "qzeros"])
+    return False
+
+
+def is_packed(param_name,
+              quant_config: Optional[WeightQuantizationConfig] = None):
+    """Returns True if each element of state_dict[param_name] contains more than
+    one parameter. For example, with AWQ quantization, each INT32 element
+    corresponds to 8 INT4 weights. Otherwise, returns False.
+    """
+    if quant_config and quant_config.method == "awq":
+        return any(tag in param_name for tag in ["qweight", "qzeros"])
+    return False
 
 def get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
     lock_dir = cache_dir if cache_dir is not None else "/tmp"
@@ -120,6 +142,21 @@ def hf_model_weights_iterator(
     model_name_or_path: str,
     cache_dir: Optional[str] = None,
     load_format: str = "auto",
+    quant_config: Optional[WeightQuantizationConfig] = None,
+) -> Iterator[Tuple[str, torch.Tensor, bool, bool]]:
+    # handle quantization
+    for name, param in _hf_model_weights_iterator_noquant(model_name_or_path, cache_dir, load_format):
+        transposed = is_transposed(name, quant_config=quant_config)
+        packed = is_packed(name, quant_config=quant_config)
+        if transposed:
+            param = param.T
+        yield name, param, transposed, packed
+
+
+def _hf_model_weights_iterator_noquant(
+    model_name_or_path: str,
+    cache_dir: Optional[str] = None,
+    load_format: str = "auto",
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     use_safetensors = False
     use_np_cache = False
@@ -173,7 +210,7 @@ def hf_model_weights_iterator(
             param_path = os.path.join(np_folder, name)
             with open(param_path, "rb") as f:
                 param = np.load(f)
-            yield name, torch.from_numpy(param)
+            yield name, param
     elif use_safetensors:
         for st_file in hf_weights_files:
             with safe_open(st_file, framework="pt") as f:
@@ -245,6 +282,13 @@ def load_tensor_parallel_weights(
         f"{param_name} shape mismatch between model and checkpoint: "
         f"{param.shape} != {loaded_weight.shape}")
     param.data.copy_(loaded_weight)
+
+
+def get_param(state_dict, key, transposed=False):
+    param = state_dict[key]
+    if transposed:
+        return param.T
+    return param
 
 
 def initialize_dummy_weights(
