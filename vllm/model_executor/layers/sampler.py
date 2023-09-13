@@ -277,24 +277,28 @@ def _apply_top_p_top_k_(
     return logits
 
 
-def _get_topk_logprobs(
+def _get_output_logprobs(
     logprobs: torch.Tensor,
     num_logprobs: Optional[int],
+    token_logprobs: List[int],
 ) -> Dict[int, float]:
-    if num_logprobs is None or num_logprobs == 0:
-        return {}
-
-    topk_logprobs, topk_ids = torch.topk(logprobs, num_logprobs)
-    if num_logprobs == 1:
-        topk_logprobs = [topk_logprobs.item()]
-        topk_ids = [topk_ids.item()]
-    else:
-        topk_logprobs = topk_logprobs.tolist()
-        topk_ids = topk_ids.tolist()
-
     token_to_logprob: Dict[int, float] = {}
-    for token_id, logprob in zip(topk_ids, topk_logprobs):
-        token_to_logprob[token_id] = logprob
+
+    if num_logprobs is not None and num_logprobs > 0:
+        topk_logprobs, topk_ids = torch.topk(logprobs, num_logprobs)
+        if num_logprobs == 1:
+            topk_logprobs = [topk_logprobs.item()]
+            topk_ids = [topk_ids.item()]
+        else:
+            topk_logprobs = topk_logprobs.tolist()
+            topk_ids = topk_ids.tolist()
+
+        for token_id, logprob in zip(topk_ids, topk_logprobs):
+            token_to_logprob[token_id] = logprob
+
+    for token_id in token_logprobs:
+        token_to_logprob[token_id] = logprobs[token_id].item()
+
     return token_to_logprob
 
 
@@ -404,8 +408,8 @@ def _sample(
             # Sample the next tokens.
             next_token_ids = _sample_from_prompt(prob, sampling_params)
             # Get top-k log probabilities for the next tokens.
-            next_logprobs = _get_topk_logprobs(logprob,
-                                               sampling_params.logprobs)
+            next_logprobs = _get_output_logprobs(logprob, sampling_params.logprobs,
+                                                 sampling_params.token_logprobs)
 
             # Build the output.
             for next_token_id in next_token_ids:
@@ -449,8 +453,8 @@ def _sample(
             # Get top-k log probabilities for the next tokens.
             next_logprobs: Dict[int, Dict[int, float]] = {}
             for j, seq_id in enumerate(seq_ids):
-                next_logprobs[seq_id] = _get_topk_logprobs(
-                    logprob[j], sampling_params.logprobs)
+                next_logprobs[seq_id] = _get_output_logprobs(
+                    logprob[j], sampling_params.logprobs, sampling_params.token_logprobs)
 
             # Build the output.
             for parent_seq_id, next_token_id in zip(parent_seq_ids,

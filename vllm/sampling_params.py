@@ -67,6 +67,7 @@ class SamplingParams:
         ignore_eos: bool = False,
         max_tokens: int = 16,
         logprobs: Optional[int] = None,
+        token_logprobs: List[int] = [],
         prompt_logprobs: bool = False,
     ) -> None:
         self.n = n
@@ -88,6 +89,7 @@ class SamplingParams:
         self.ignore_eos = ignore_eos
         self.max_tokens = max_tokens
         self.logprobs = logprobs
+        self.token_logprobs = token_logprobs
         self.prompt_logprobs = prompt_logprobs
 
         self._verify_args()
@@ -125,6 +127,9 @@ class SamplingParams:
         if self.logprobs is not None and self.logprobs < 0:
             raise ValueError(
                 f"logprobs must be non-negative, got {self.logprobs}.")
+        if not all(t >= 0 for t in self.token_logprobs):
+            raise ValueError(
+                f"token_logprobs must be non-negative, got {self.token_logprobs}.")
 
     def _verify_beam_search(self) -> None:
         if self.best_of == 1:
@@ -175,4 +180,5 @@ class SamplingParams:
                 f"ignore_eos={self.ignore_eos}, "
                 f"max_tokens={self.max_tokens}, "
                 f"logprobs={self.logprobs}), "
+                f"token_logprobs={self.token_logprobs}), "
                 f"prompt_logprobs={self.prompt_logprobs})")
