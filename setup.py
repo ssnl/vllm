@@ -123,7 +123,7 @@ ext_modules.append(attention_extension)
 # Quantization kernels.
 quantization_extension = CUDAExtension(
     name="vllm.quantization_ops",
-    sources=["csrc/quantization.cpp", "csrc/quantization/quantization_kernels.cu"],
+    sources=["csrc/quantization.cpp", "csrc/quantization/gemm_cuda_gen.cu", "csrc/quantization/gemv_cuda.cu"],
     extra_compile_args={"cxx": CXX_FLAGS, "nvcc": QUANT_NVCC_FLAGS},
 )
 ext_modules.append(quantization_extension)

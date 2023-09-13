@@ -1,18 +1,20 @@
 /*
 https://github.com/mit-han-lab/llm-awq
+
 @article{lin2023awq,
   title={AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration},
   author={Lin, Ji and Tang, Jiaming and Tang, Haotian and Yang, Shang and Dang, Xingyu and Han, Song},
   journal={arXiv},
   year={2023}
 }
+
  */
 
 
 #include <torch/extension.h>
+#include "dequantize.cuh"
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAGuard.h>
-#include "dequantize.cuh"
 
 
 // Pack two half values.
@@ -23,13 +25,13 @@ __pack_half2(const half x, const half y) {
   return (v1 << 16) | v0;
 }
 
-__global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n128k32(int G, int split_k_iters, half* __restrict__ A, int* __restrict__ B, half* __restrict__ scaling_factors, int* __restrict__ zeros, int M, int IC, int OC, half* __restrict__ C) 
+__global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n128k32(int G, int split_k_iters, half* __restrict__ A, int* __restrict__ B, half* __restrict__ scaling_factors, int* __restrict__ zeros, int M, int IC, int OC, half* __restrict__ C)
 {
   static constexpr uint32_t ZERO = 0x0;
   float C_warp[32];
   __shared__ half A_shared[16 * (32 + 8)];
   __shared__ half B_shared[32 * (128 + 8)];
-  
+
   __shared__ half scaling_factors_shared[128];
   __shared__ half zeros_shared[128];
 
@@ -53,19 +55,19 @@ __global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n128k32(int G, i
   bool ld_A_flag = (blockIdx_y / j_factors1 * 16 + threadIdx.y * row_stride_warp + threadIdx.x * 8 / 32) < M;     // threadIdx.y is warp_id
   // bool wb_C_flag = (threadIdx.x / 4) < M;
 
-  half* A_ptr = A 
+  half* A_ptr = A
                 + (((int)blockIdx_y) / j_factors1 * 16 + (((int)threadIdx.y) * row_stride_warp) + ((int)threadIdx.x) / (32 / 8)) * IC
                 + (((int)threadIdx.x) % (32 / 8)) * 8;
-  
+
   int* B_ptr = B
             + ((int)threadIdx.y) * (OC / 8) * 2
             + (((int)threadIdx.x) / (128 / 8)) * (OC / 8)
             + (((int)blockIdx_y) % j_factors1) * (128 / 8)
             + (((int)threadIdx.x) % (128 / 8)) * 1;
 // Why * 1 in the above line?
-                        
-  half* A_shared_ptr = A_shared 
-                    + ((int)threadIdx.y) * row_stride_warp * (32 + 8) 
+
+  half* A_shared_ptr = A_shared
+                    + ((int)threadIdx.y) * row_stride_warp * (32 + 8)
                     + (((int)threadIdx.x) / (32 / 8)) * (32 + 8)
                     + (((int)threadIdx.x) % (32 / 8) ) * 8;
 
@@ -73,16 +75,16 @@ __global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n128k32(int G, i
                     + ((int)threadIdx.y) * (row_stride / 2) * (128 + 8)
                     + (((int)threadIdx.x) / (128 / 8)) * (128 + 8)
                     + (((int)threadIdx.x) % (128 / 8)) * 8;
-  
+
   int* zeros_ptr = zeros
                 + (((int)blockIdx_y) % j_factors1) * (128 / 8)
                 + ((int)threadIdx.x) % (128 / 8);
-  
+
   half* scaling_factors_ptr = scaling_factors
-                            + (((int)blockIdx_y) % j_factors1) * (128) 
+                            + (((int)blockIdx_y) % j_factors1) * (128)
                             + (((int)threadIdx.x) % (128 / 8)) * 8;
 
-  half* C_ptr = C 
+  half* C_ptr = C
               + blockIdx_z * M * OC        // blockIdz.x -> split_k dim
               + (((int)blockIdx_y) % j_factors1) * 128
               + ((int)threadIdx.y) * 64
@@ -122,7 +124,7 @@ __global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n128k32(int G, i
       // each warp: 32 x 4
       // each thr: read 32 bit -> convert to 8xFP16 (a UINT4) -> scale and minus zero -> WB UINT4
       // *(uint4*)(B_shared + ((((ax0_ax1_fused_0 * 544) + (((int)threadIdx.y) * 272)) + ((((int)threadIdx.x) >> 4) * 136)) + ((((int)threadIdx.x) & 15) * 8))) = *(uint4*)(B + ((((((k_0_0 * 163840) + (ax0_ax1_fused_0 * 20480)) + (((int)threadIdx.y) * 10240)) + ((((int)threadIdx.x) >> 4) * 5120)) + (((int)blockIdx_y) * 128)) + ((((int)threadIdx.x) & 15) * 8)));
-      // row stride in shared memory: (NWARPS * 32 * 8 / cta_N) 
+      // row stride in shared memory: (NWARPS * 32 * 8 / cta_N)
       uint32_t B_loaded = *(uint32_t*)(B_ptr_local + ax0_ax1_fused_0 * row_stride * (OC / 8));
       uint4 B_loaded_fp16 = dequantize_s4_to_fp16x2(B_loaded);
       //uint4 B_loaded_zero = *(uint4*)(zeros_shared + (threadIdx.x % (cta_N / 8)) * 8);
@@ -216,13 +218,13 @@ __global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n128k32(int G, i
 }
 
 
-__global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n64k32(int G, int split_k_iters, half* __restrict__ A, int* __restrict__ B, half* __restrict__ scaling_factors, int* __restrict__ zeros, int M, int IC, int OC, half* __restrict__ C) 
+__global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n64k32(int G, int split_k_iters, half* __restrict__ A, int* __restrict__ B, half* __restrict__ scaling_factors, int* __restrict__ zeros, int M, int IC, int OC, half* __restrict__ C)
 {
   static constexpr uint32_t ZERO = 0x0;
   float C_warp[32];
   __shared__ half A_shared[16 * (32 + 8)];
   __shared__ half B_shared[32 * (64 + 8)];
-  
+
   __shared__ half scaling_factors_shared[64];
   __shared__ half zeros_shared[64];
 
@@ -247,19 +249,19 @@ __global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n64k32(int G, in
   bool ld_A_flag = (blockIdx_y / j_factors1 * 16 + threadIdx.y * row_stride_warp + threadIdx.x * 8 / 32) < M;     // threadIdx.y is warp_id
   // bool wb_C_flag = (threadIdx.x / 4) < M;
 
-  half* A_ptr = A 
+  half* A_ptr = A
                 + (((int)blockIdx_y) / j_factors1 * 16 + (((int)threadIdx.y) * row_stride_warp) + ((int)threadIdx.x) / (32 / 8)) * IC
                 + (((int)threadIdx.x) % (32 / 8)) * 8;
-  
+
   int* B_ptr = B
             + ((int)threadIdx.y) * (OC / 8) * 4
             + (((int)threadIdx.x) / (64 / 8)) * (OC / 8)
             + (((int)blockIdx_y) % j_factors1) * (64 / 8)
             + (((int)threadIdx.x) % (64 / 8)) * 1;
 // Why * 1 in the above line?
-                        
-  half* A_shared_ptr = A_shared 
-                    + ((int)threadIdx.y) * row_stride_warp * (32 + 8) 
+
+  half* A_shared_ptr = A_shared
+                    + ((int)threadIdx.y) * row_stride_warp * (32 + 8)
                     + (((int)threadIdx.x) / (32 / 8)) * (32 + 8)
                     + (((int)threadIdx.x) % (32 / 8) ) * 8;
 
@@ -267,16 +269,16 @@ __global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n64k32(int G, in
                     + ((int)threadIdx.y) * (row_stride / 2) * (64 + 8)
                     + (((int)threadIdx.x) / (64 / 8)) * (64 + 8)
                     + (((int)threadIdx.x) % (64 / 8)) * 8;
-  
+
   int* zeros_ptr = zeros
                 + (((int)blockIdx_y) % j_factors1) * (64 / 8)
                 + ((int)threadIdx.x) % (64 / 8);
-  
+
   half* scaling_factors_ptr = scaling_factors
-                            + (((int)blockIdx_y) % j_factors1) * (64) 
+                            + (((int)blockIdx_y) % j_factors1) * (64)
                             + (((int)threadIdx.x) % (64 / 8)) * 8;
 
-  half* C_ptr = C 
+  half* C_ptr = C
               + blockIdx_z * M * OC        // blockIdz.x -> split_k dim
               + (((int)blockIdx_y) % j_factors1) * 64
               + ((int)threadIdx.y) * 32
@@ -316,7 +318,7 @@ __global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n64k32(int G, in
       // each warp: 32 x 4
       // each thr: read 32 bit -> convert to 8xFP16 (a UINT4) -> scale and minus zero -> WB UINT4
       // *(uint4*)(B_shared + ((((ax0_ax1_fused_0 * 544) + (((int)threadIdx.y) * 272)) + ((((int)threadIdx.x) >> 4) * 136)) + ((((int)threadIdx.x) & 15) * 8))) = *(uint4*)(B + ((((((k_0_0 * 163840) + (ax0_ax1_fused_0 * 20480)) + (((int)threadIdx.y) * 10240)) + ((((int)threadIdx.x) >> 4) * 5120)) + (((int)blockIdx_y) * 128)) + ((((int)threadIdx.x) & 15) * 8)));
-      // row stride in shared memory: (NWARPS * 32 * 8 / cta_N) 
+      // row stride in shared memory: (NWARPS * 32 * 8 / cta_N)
       uint32_t B_loaded = *(uint32_t*)(B_ptr_local + ax0_ax1_fused_0 * row_stride * (OC / 8));
       uint4 B_loaded_fp16 = dequantize_s4_to_fp16x2(B_loaded);
       //uint4 B_loaded_zero = *(uint4*)(zeros_shared + (threadIdx.x % (cta_N / 8)) * 8);
@@ -343,7 +345,7 @@ __global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n64k32(int G, in
     }
     __syncthreads();
 
-    for (int k_0_1 = 0; k_0_1 < 2; ++k_0_1) 
+    for (int k_0_1 = 0; k_0_1 < 2; ++k_0_1)
     {
       {
         unsigned int addr;
@@ -359,9 +361,9 @@ __global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n64k32(int G, in
           : "r"(addr)
         );
       }
-        
 
-      for (int ax1_0 = 0; ax1_0 < 2; ++ax1_0) 
+
+      for (int ax1_0 = 0; ax1_0 < 2; ++ax1_0)
       {
         {
           unsigned int addr;
@@ -378,8 +380,8 @@ __global__ void __launch_bounds__(64) gemm_forward_4bit_cuda_m16n64k32(int G, in
           );
         }
       }
-      
-      for (int j_0_4 = 0; j_0_4 < 2; ++j_0_4) 
+
+      for (int j_0_4 = 0; j_0_4 < 2; ++j_0_4)
       {
 
         {
@@ -465,7 +467,7 @@ torch::Tensor gemm_forward_cuda(
     {
 	int j_factors1 = num_out_channels / 64 / 1;
         dim3 num_blocks(1 * (num_out_feats + 16 - 1) / 16 * j_factors1 * split_k_iters);
-    
+
         // threadIdx.x: 32
         // threadIdx.y: i_factors[2] * j_factors[2]
         dim3 threads_per_block(32, 2);
