@@ -11,7 +11,7 @@ logger = init_logger(__name__)
 
 _GB = 1 << 30
 
-_ALLOWED_QUANTIZATION_METHODS = ["awq"]
+_ALLOWED_QUANTIZATION_METHODS = ["awq_gemm", "awq_gemv"]
 _ALLOWED_QUANTIZATION_BITWIDTHS = [4]
 _AWQ_DTYPE_BITWIDTH = 32
 

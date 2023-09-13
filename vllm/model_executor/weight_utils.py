@@ -29,7 +29,7 @@ def is_transposed(param_name,
     """Returns True if the parameter tensor given by state_dict[param_name] is
     transposed relative to torch.nn.Linear.weight. Otherwise, returns False.
     """
-    if quant_config and quant_config.method == "awq":
+    if quant_config and quant_config.method == "awq_gemm":
         return any(tag in param_name
                    for tag in ["qweight", "scales", "qzeros"])
     return False
@@ -41,7 +41,7 @@ def is_packed(param_name,
     one parameter. For example, with AWQ quantization, each INT32 element
     corresponds to 8 INT4 weights. Otherwise, returns False.
     """
-    if quant_config and quant_config.method == "awq":
+    if quant_config and quant_config.method.startswith("awq_"):
         return any(tag in param_name for tag in ["qweight", "qzeros"])
     return False
 

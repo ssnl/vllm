@@ -7,11 +7,14 @@
 # repo: https://github.com/pytorch/pytorch
 
 
+from typing import *
+
 import torch
 import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn.parameter import Parameter
 
+from vllm.config import WeightQuantizationConfig
 from vllm.model_executor.layers.quantized_linear import awq_linear
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -205,6 +208,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         return output
 
 
+
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
 
@@ -241,7 +245,7 @@ class ColumnParallelLinear(torch.nn.Module):
                  params_dtype=None,
                  use_cpu_initialization=False,
                  perform_initialization=True,
-                 quant_config=None,
+                 quant_config: Optional[WeightQuantizationConfig] = None,
                  ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -284,20 +288,59 @@ class ColumnParallelLinear(torch.nn.Module):
             self.register_parameter('scales', None)
         else:
             # Quantized parameters.
-            assert self.input_size % self.quant_config.w_bit == 0
-            assert self.output_size_per_partition % self.quant_config.pack_factor == 0
-            self.qweight = Parameter(torch.empty(
-                self.input_size,
-                self.output_size_per_partition // self.quant_config.pack_factor,
-                device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
-            self.qzeros = Parameter(torch.empty(
-                self.input_size // self.quant_config.group_size,
-                self.output_size_per_partition // self.quant_config.pack_factor,
-                device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
-            self.scales = Parameter(torch.empty(
-                self.input_size // self.quant_config.group_size,
-                self.output_size_per_partition,
-                device=torch.cuda.current_device(), dtype=params_dtype), requires_grad=False)
+            if quant_config.method == 'awq_gemm':
+                assert self.input_size % self.quant_config.w_bit == 0
+                assert self.output_size_per_partition % self.quant_config.pack_factor == 0
+                self.qweight = Parameter(torch.empty(
+                    self.input_size,
+                    self.output_size_per_partition // self.quant_config.pack_factor,
+                    device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+                self.qzeros = Parameter(torch.empty(
+                    self.input_size // self.quant_config.group_size,
+                    self.output_size_per_partition // self.quant_config.pack_factor,
+                    device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+                self.scales = Parameter(torch.empty(
+                    self.input_size // self.quant_config.group_size,
+                    self.output_size_per_partition,
+                    device=torch.cuda.current_device(), dtype=params_dtype), requires_grad=False)
+            elif quant_config.method == 'awq_gemv':
+                assert self.input_size % self.quant_config.group_size == 0
+                assert self.output_size_per_partition % self.quant_config.pack_factor == 0
+
+                def make_divisible(c, divisor):
+                    return (c + divisor - 1) // divisor
+
+                def calculate_zeros_width(in_features):
+                    pack_num = quant_config.pack_factor
+                    group_size = quant_config.group_size
+                    if group_size >= 128:
+                        size_multiplier = 1
+                    elif group_size == 64:
+                        size_multiplier = 2
+                    elif group_size == 32:
+                        size_multiplier = 4
+                    else:
+                        raise NotImplementedError
+
+                    base_width = make_divisible(in_features // group_size, pack_num)
+                    base_width = make_divisible(base_width, size_multiplier) * size_multiplier
+                    return base_width
+
+
+                self.qweight = Parameter(torch.empty(
+                    self.output_size_per_partition,
+                    self.input_size // self.quant_config.pack_factor,
+                    device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+                self.qzeros = Parameter(torch.empty(
+                    self.output_size_per_partition,
+                    calculate_zeros_width(self.input_size),
+                    device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+                self.scales = Parameter(torch.empty(
+                    self.output_size_per_partition,
+                    calculate_zeros_width(self.input_size) * self.quant_config.pack_factor,
+                    device=torch.cuda.current_device(), dtype=params_dtype), requires_grad=False)
+            else:
+                raise ValueError(quant_config.method)
             self.register_parameter('weight', None)
 
         if bias:
@@ -332,8 +375,8 @@ class ColumnParallelLinear(torch.nn.Module):
         input_parallel = input_
 
         # Matrix multiply.
-        if self.quant_config and self.quant_config.method == "awq":
-            output_parallel = awq_linear(input_parallel, self.qweight, self.scales, self.qzeros, bias, pack_factor=self.quant_config.pack_factor)
+        if self.quant_config:
+            output_parallel = awq_linear(input_parallel, self.qweight, self.scales, self.qzeros, bias, quant_config=self.quant_config)
         else:
             output_parallel = F.linear(input_parallel, self.weight, bias)
 
@@ -435,20 +478,59 @@ class RowParallelLinear(torch.nn.Module):
             self.register_parameter('scales', None)
         else:
             # Quantized parameters.
-            assert self.input_size_per_partition % self.quant_config.w_bit == 0
-            assert self.output_size % self.quant_config.pack_factor == 0
-            self.qweight = Parameter(torch.empty(
-                self.input_size_per_partition,
-                self.output_size // self.quant_config.pack_factor,
-                device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
-            self.qzeros = Parameter(torch.empty(
-                self.input_size_per_partition // self.quant_config.group_size,
-                self.output_size // self.quant_config.pack_factor,
-                device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
-            self.scales = Parameter(torch.empty(
-                self.input_size_per_partition // self.quant_config.group_size,
-                self.output_size,
-                device=torch.cuda.current_device(), dtype=params_dtype), requires_grad=False)
+            if quant_config.method == 'awq_gemm':
+                assert self.input_size_per_partition % self.quant_config.w_bit == 0
+                assert self.output_size % self.quant_config.pack_factor == 0
+                self.qweight = Parameter(torch.empty(
+                    self.input_size_per_partition,
+                    self.output_size // self.quant_config.pack_factor,
+                    device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+                self.qzeros = Parameter(torch.empty(
+                    self.input_size_per_partition // self.quant_config.group_size,
+                    self.output_size // self.quant_config.pack_factor,
+                    device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+                self.scales = Parameter(torch.empty(
+                    self.input_size_per_partition // self.quant_config.group_size,
+                    self.output_size,
+                    device=torch.cuda.current_device(), dtype=params_dtype), requires_grad=False)
+            elif quant_config.method == 'awq_gemv':
+                assert self.input_size_per_partition % self.quant_config.group_size == 0
+                assert self.output_size % self.quant_config.pack_factor == 0
+
+                def make_divisible(c, divisor):
+                    return (c + divisor - 1) // divisor
+
+                def calculate_zeros_width(in_features):
+                    pack_num = quant_config.pack_factor
+                    group_size = quant_config.group_size
+                    if group_size >= 128:
+                        size_multiplier = 1
+                    elif group_size == 64:
+                        size_multiplier = 2
+                    elif group_size == 32:
+                        size_multiplier = 4
+                    else:
+                        raise NotImplementedError
+
+                    base_width = make_divisible(in_features // group_size, pack_num)
+                    base_width = make_divisible(base_width, size_multiplier) * size_multiplier
+                    return base_width
+
+
+                self.qweight = Parameter(torch.empty(
+                    self.output_size,
+                    self.input_size_per_partition // self.quant_config.pack_factor,
+                    device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+                self.qzeros = Parameter(torch.empty(
+                    self.output_size,
+                    calculate_zeros_width(self.input_size_per_partition),
+                    device=torch.cuda.current_device(), dtype=torch.int32), requires_grad=False)
+                self.scales = Parameter(torch.empty(
+                    self.output_size,
+                    calculate_zeros_width(self.input_size_per_partition) * self.quant_config.pack_factor,
+                    device=torch.cuda.current_device(), dtype=params_dtype), requires_grad=False)
+            else:
+                raise ValueError(quant_config.method)
             self.register_parameter('weight', None)
 
         if not reduce_results and (bias and not skip_bias_add):
@@ -487,8 +569,8 @@ class RowParallelLinear(torch.nn.Module):
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
 
         # Matrix multiply.
-        if self.quant_config and self.quant_config.method == "awq":
-            output_parallel = awq_linear(input_parallel, self.qweight, self.scales, self.qzeros, pack_factor=self.quant_config.pack_factor)
+        if self.quant_config:
+            output_parallel = awq_linear(input_parallel, self.qweight, self.scales, self.qzeros, quant_config=self.quant_config)
         else:
             output_parallel = F.linear(input_parallel, self.weight)
 
