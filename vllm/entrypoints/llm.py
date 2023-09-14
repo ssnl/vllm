@@ -1,6 +1,6 @@
 from typing import List, Optional, Union
 
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from vllm.engine.arg_utils import EngineArgs
