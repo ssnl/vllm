@@ -1,6 +1,7 @@
 from typing import List, Optional, Union
 
 import asyncio
+import threading
 
 from tqdm.auto import tqdm
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
@@ -68,6 +69,19 @@ class LLM:
         self.llm_engine = LLMEngine.from_engine_args(engine_args)
         self.request_counter = Counter()
 
+        self._loop = asyncio.new_event_loop()
+        self._thr = threading.Thread(target=self._loop.run_forever, name="Async Runner", daemon=True)
+
+    def _run_async(self, coro):  # coro is a couroutine, see example
+        # https://stackoverflow.com/a/74710015
+
+        # This will block the calling thread until the coroutine is finished.
+        # Any exception that occurs in the coroutine is raised in the caller
+        if not self._thr.is_alive():
+            self._thr.start()
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
     def get_tokenizer(
             self) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
         return self.llm_engine.tokenizer
@@ -103,10 +117,10 @@ class LLM:
             A list of `RequestOutput` objects containing the generated
             completions in the same order as the input prompts.
         """
-        return asyncio.run(self.agenerate(prompts, sampling_params,
+        return self._run_async(self.generate_async(prompts, sampling_params,
                                           prompt_token_ids, use_tqdm))
 
-    async def agenerate(
+    async def generate_async(
         self,
         prompts: Optional[Union[str, List[str]]] = None,
         sampling_params: Optional[SamplingParams] = None,
