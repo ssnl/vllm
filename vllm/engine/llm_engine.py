@@ -1,5 +1,6 @@
 import copy
 import time
+import asyncio
 from functools import partial
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union
 
@@ -98,12 +99,13 @@ class LLMEngine:
 
         # Create the parallel GPU workers.
         if self.parallel_config.worker_use_ray:
-            self._init_workers_ray(placement_group)
+            ainit = self._ainit_workers_ray(placement_group)
         else:
-            self._init_workers(distributed_init_method)
+            ainit = self._ainit_workers(distributed_init_method)
+        asyncio.run(ainit)
 
         # Profile the memory usage and initialize the cache.
-        self._init_cache()
+        asyncio.run(self._ainit_cache())
 
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config)
@@ -115,7 +117,7 @@ class LLMEngine:
         # List of (timestamp, num_tokens)
         self.num_generation_tokens: List[Tuple[float, int]] = []
 
-    def _init_workers(self, distributed_init_method: str):
+    async def _ainit_workers(self, distributed_init_method: str):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
         # before CUDA_VISIBLE_DEVICES is set in the Worker
         from vllm.worker.worker import Worker  # pylint: disable=import-outside-toplevel
@@ -132,12 +134,12 @@ class LLMEngine:
             distributed_init_method,
         )
         self.workers.append(worker)
-        self._run_workers(
+        await self._arun_workers(
             "init_model",
             get_all_outputs=True,
         )
 
-    def _init_workers_ray(self, placement_group: "PlacementGroup",
+    async def _ainit_workers_ray(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
         # before CUDA_VISIBLE_DEVICES is set in the Worker
@@ -162,7 +164,7 @@ class LLMEngine:
         model_config = copy.deepcopy(self.model_config)
         parallel_config = copy.deepcopy(self.parallel_config)
         scheduler_config = copy.deepcopy(self.scheduler_config)
-        self._run_workers("init_worker",
+        await self._arun_workers("init_worker",
                           get_all_outputs=True,
                           worker_init_fn=lambda: Worker(
                               model_config,
@@ -171,7 +173,7 @@ class LLMEngine:
                               None,
                               None,
                           ))
-        self._run_workers(
+        await self._arun_workers(
             "init_model",
             get_all_outputs=True,
         )
@@ -180,10 +182,10 @@ class LLMEngine:
         self.model_config.verify_with_parallel_config(self.parallel_config)
         self.cache_config.verify_with_parallel_config(self.parallel_config)
 
-    def _init_cache(self) -> None:
+    async def _ainit_cache(self) -> None:
         """Profiles the memory usage and initializes the KV cache."""
         # Get the maximum number of blocks that can be allocated on GPU and CPU.
-        num_blocks = self._run_workers(
+        num_blocks = await self._arun_workers(
             "profile_num_available_blocks",
             get_all_outputs=True,
             block_size=self.cache_config.block_size,
@@ -209,7 +211,7 @@ class LLMEngine:
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
         # Initialize the cache.
-        self._run_workers("init_cache_engine", cache_config=self.cache_config)
+        await self._arun_workers("init_cache_engine", cache_config=self.cache_config)
 
     @classmethod
     def from_engine_args(cls, engine_args: EngineArgs) -> "LLMEngine":
@@ -552,13 +554,24 @@ class LLMEngine:
         and updates the scheduler with the model outputs. Finally, it decodes
         the sequences and returns the newly generated results.
         """
+        return asyncio.run(self.astep())
+
+    async def astep(self) -> List[RequestOutput]:
+        """Performs one decoding iteration and returns newly generated results.
+
+        This function performs one decoding iteration of the engine. It first
+        schedules the sequences to be executed in the next iteration and the
+        token blocks to be swapped in/out/copy. Then, it executes the model
+        and updates the scheduler with the model outputs. Finally, it decodes
+        the sequences and returns the newly generated results.
+        """
         (seq_group_metadata_list, scheduler_outputs,
          early_return) = self._schedule()
         if early_return is not None:
             return early_return
 
         # Execute the model.
-        output = self._run_workers(
+        output = await self._arun_workers(
             "execute_model",
             seq_group_metadata_list=seq_group_metadata_list,
             blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
@@ -670,7 +683,7 @@ class LLMEngine:
             seq.status = SequenceStatus.FINISHED_STOPPED
             return
 
-    def _run_workers(
+    async def _arun_workers(
         self,
         method: str,
         *args,
@@ -689,7 +702,7 @@ class LLMEngine:
             all_outputs.append(output)
 
         if self.parallel_config.worker_use_ray:
-            all_outputs = ray.get(all_outputs)
+            all_outputs = await all_outputs
 
         if get_all_outputs:
             return all_outputs
