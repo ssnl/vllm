@@ -68,11 +68,11 @@ class Sampler(nn.Module):
         logits.div_(sampling_tensors.temperatures.unsqueeze_(dim=1))
 
         if do_top_p_top_k:
-            logits = _apply_top_p_top_k(logits, sampling_tensors.top_ps,
+            logits = _apply_top_p_top_k_(logits, sampling_tensors.top_ps,
                                         sampling_tensors.top_ks)
 
         if do_min_p:
-            logits = _apply_min_p(logits, sampling_tensors.min_ps)
+            logits = _apply_min_p_(logits, sampling_tensors.min_ps)
 
         # We use float32 for probabilities and log probabilities.
         # Compute the probabilities.
@@ -197,7 +197,7 @@ def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
     return logits
 
 
-def _apply_top_p_top_k(
+def _apply_top_p_top_k_(
     logits: torch.Tensor,
     p: torch.Tensor,
     k: torch.Tensor,
@@ -225,11 +225,11 @@ def _apply_top_p_top_k(
     logits_idx_inv = torch.empty_like(logits_idx).scatter_(dim=-1,
                                                            index=logits_idx,
                                                            src=src)
-    logits = torch.gather(logits_sort, dim=-1, index=logits_idx_inv)
+    logits = torch.gather(logits_sort, dim=-1, index=logits_idx_inv, out=logits)
     return logits
 
 
-def _apply_min_p(
+def _apply_min_p_(
     logits: torch.Tensor,
     min_p: torch.Tensor,
 ) -> torch.Tensor:
@@ -476,6 +476,7 @@ def _get_logprobs(
         batched_logprobs_query_seq_indices,
         batched_logprobs_query_token_indices
     ]]
+    batched_logprobs_query_result = batched_logprobs_query_result.cpu()
 
     # Batched query for logprobs of topk tokens
     if largest_num_logprobs > 0:
@@ -487,7 +488,11 @@ def _get_logprobs(
     else:
         top_logprobs, top_token_ids = None, None
 
-    batched_logprobs_query_result = batched_logprobs_query_result.cpu()
+    # Batched query for token_logprobs
+    token_logprobs = {
+        token_id : logprobs[..., token_id].cpu()
+        for token_id in sampling_params.token_logprobs
+    }
 
     # Gather results
     result_prompt_logprobs: List[Optional[PromptLogprobs]] = []
@@ -541,6 +546,8 @@ def _get_logprobs(
                                       parent_id, :num_logprobs].tolist(),
                         top_logprobs[sample_idx +
                                      parent_id, :num_logprobs].tolist()))
+            for token_id in sampling_params.token_logprobs:
+                sample_logprobs_dict[token_id] = token_logprobs[token_id][sample_idx + parent_id].item()
             group_sample_logprobs.append(sample_logprobs_dict)
         result_sample_logprobs.append(group_sample_logprobs)
         sample_idx += len(seq_ids)
