@@ -1,6 +1,9 @@
 from typing import List, Optional, Union
 
-from tqdm import tqdm
+import asyncio
+import threading
+
+from tqdm.auto import tqdm
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from vllm.engine.arg_utils import EngineArgs
@@ -104,6 +107,18 @@ class LLM:
         )
         self.llm_engine = LLMEngine.from_engine_args(engine_args)
         self.request_counter = Counter()
+        self._loop = asyncio.new_event_loop()
+        self._thr = threading.Thread(target=self._loop.run_forever, name="Async Runner", daemon=True)
+
+    def _run_async(self, coro):  # coro is a couroutine, see example
+        # https://stackoverflow.com/a/74710015
+
+        # This will block the calling thread until the coroutine is finished.
+        # Any exception that occurs in the coroutine is raised in the caller
+        if not self._thr.is_alive():
+            self._thr.start()
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
 
     def get_tokenizer(
             self) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
@@ -116,6 +131,34 @@ class LLM:
         self.llm_engine.tokenizer = tokenizer
 
     def generate(
+        self,
+        prompts: Optional[Union[str, List[str]]] = None,
+        sampling_params: Optional[SamplingParams] = None,
+        prompt_token_ids: Optional[List[List[int]]] = None,
+        use_tqdm: bool = True,
+    ) -> List[RequestOutput]:
+        """Generates the completions for the input prompts.
+
+        NOTE: This class automatically batches the given prompts, considering
+        the memory constraint. For the best performance, put all of your prompts
+        into a single list and pass it to this method.
+
+        Args:
+            prompts: A list of prompts to generate completions for.
+            sampling_params: The sampling parameters for text generation. If
+                None, we use the default sampling parameters.
+            prompt_token_ids: A list of token IDs for the prompts. If None, we
+                use the tokenizer to convert the prompts to token IDs.
+            use_tqdm: Whether to use tqdm to display the progress bar.
+
+        Returns:
+            A list of `RequestOutput` objects containing the generated
+            completions in the same order as the input prompts.
+        """
+        return self._run_async(self.agenerate(prompts, sampling_params,
+                                          prompt_token_ids, use_tqdm))
+
+    async def agenerate(
         self,
         prompts: Optional[Union[str, List[str]]] = None,
         sampling_params: Optional[SamplingParams] = None,
@@ -162,7 +205,7 @@ class LLM:
             token_ids = None if prompt_token_ids is None else prompt_token_ids[
                 i]
             self._add_request(prompt, sampling_params, token_ids)
-        return self._run_engine(use_tqdm)
+        return await self._arun_engine(use_tqdm)
 
     def _add_request(
         self,
@@ -174,7 +217,7 @@ class LLM:
         self.llm_engine.add_request(request_id, prompt, sampling_params,
                                     prompt_token_ids)
 
-    def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
+    async def _arun_engine(self, use_tqdm: bool) -> List[RequestOutput]:
         # Initialize tqdm.
         if use_tqdm:
             num_requests = self.llm_engine.get_num_unfinished_requests()
@@ -182,7 +225,7 @@ class LLM:
         # Run the engine.
         outputs: List[RequestOutput] = []
         while self.llm_engine.has_unfinished_requests():
-            step_outputs = self.llm_engine.step()
+            step_outputs = await self.llm_engine.astep()
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)

@@ -87,6 +87,14 @@ class Scheduler:
         # Add sequence groups to the waiting queue.
         self.waiting.append(seq_group)
 
+    def abort_all_seq_groups(self) -> None:
+        while self.waiting:
+            self.abort_seq_group(self.waiting[0].request_id)
+        while self.running:
+            self.abort_seq_group(self.running[0].request_id)
+        while self.swapped:
+            self.abort_seq_group(self.swapped[0].request_id)
+
     def abort_seq_group(self, request_id: Union[str, Iterable[str]]) -> None:
         if isinstance(request_id, str):
             request_id = (request_id, )

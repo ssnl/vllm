@@ -1,6 +1,8 @@
 import copy
 import os
 import time
+import asyncio
+import threading
 from functools import partial
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union
 
@@ -103,6 +105,8 @@ class LLMEngine:
             tokenizer_revision=model_config.tokenizer_revision,
             revision=model_config.revision)
         self.seq_counter = Counter()
+        self._loop = asyncio.new_event_loop()
+        self._thr = threading.Thread(target=self._loop.run_forever, name="Async Runner", daemon=True)
 
         # Create the parallel GPU workers.
         if self.parallel_config.worker_use_ray:
@@ -110,12 +114,12 @@ class LLMEngine:
             ray_usage = os.environ.get("RAY_USAGE_STATS_ENABLED", "0")
             if ray_usage != "1":
                 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
-            self._init_workers_ray(placement_group)
+            self._run_async(self._ainit_workers_ray(placement_group))
         else:
-            self._init_workers(distributed_init_method)
+            self._run_async(self._ainit_workers(distributed_init_method))
 
         # Profile the memory usage and initialize the cache.
-        self._init_cache()
+        self._run_async(self._ainit_cache())
 
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config)
@@ -127,7 +131,18 @@ class LLMEngine:
         # List of (timestamp, num_tokens)
         self.num_generation_tokens: List[Tuple[float, int]] = []
 
-    def _init_workers(self, distributed_init_method: str):
+    def _run_async(self, coro):  # coro is a couroutine, see example
+        # https://stackoverflow.com/a/74710015
+
+        # This will block the calling thread until the coroutine is finished.
+        # Any exception that occurs in the coroutine is raised in the caller
+        if not self._thr.is_alive():
+            self._thr.start()
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
+    # def _init_workers(self, distributed_init_method: str):
+    async def _ainit_workers(self, distributed_init_method: str):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
         # before CUDA_VISIBLE_DEVICES is set in the Worker
         from vllm.worker.worker import Worker
@@ -144,18 +159,18 @@ class LLMEngine:
             distributed_init_method,
         )
         self.workers.append(worker)
-        self._run_workers(
+        await self._arun_workers(
             "init_model",
             get_all_outputs=True,
         )
-        self._run_workers(
+        await self._arun_workers(
             "load_model",
             get_all_outputs=True,
             max_concurrent_workers=self.parallel_config.
             max_parallel_loading_workers,
         )
 
-    def _init_workers_ray(self, placement_group: "PlacementGroup",
+    async def _ainit_workers_ray(self, placement_group: "PlacementGroup",
                           **ray_remote_kwargs):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
         # before CUDA_VISIBLE_DEVICES is set in the Worker
@@ -184,7 +199,7 @@ class LLMEngine:
         model_config = copy.deepcopy(self.model_config)
         parallel_config = copy.deepcopy(self.parallel_config)
         scheduler_config = copy.deepcopy(self.scheduler_config)
-        self._run_workers("init_worker",
+        await self._arun_workers("init_worker",
                           get_all_outputs=True,
                           worker_init_fn=lambda: Worker(
                               model_config,
@@ -193,11 +208,11 @@ class LLMEngine:
                               None,
                               None,
                           ))
-        self._run_workers(
+        await self._arun_workers(
             "init_model",
             get_all_outputs=True,
         )
-        self._run_workers(
+        await self._arun_workers(
             "load_model",
             get_all_outputs=True,
             max_concurrent_workers=self.parallel_config.
@@ -208,10 +223,10 @@ class LLMEngine:
         self.model_config.verify_with_parallel_config(self.parallel_config)
         self.cache_config.verify_with_parallel_config(self.parallel_config)
 
-    def _init_cache(self) -> None:
+    async def _ainit_cache(self) -> None:
         """Profiles the memory usage and initializes the KV cache."""
         # Get the maximum number of blocks that can be allocated on GPU and CPU.
-        num_blocks = self._run_workers(
+        num_blocks = await self._arun_workers(
             "profile_num_available_blocks",
             get_all_outputs=True,
             block_size=self.cache_config.block_size,
@@ -245,10 +260,10 @@ class LLMEngine:
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
         # Initialize the cache.
-        self._run_workers("init_cache_engine", cache_config=self.cache_config)
+        await self._arun_workers("init_cache_engine", cache_config=self.cache_config)
         # Warm up the model. This includes capturing the model into CUDA graph
         # if enforce_eager is False.
-        self._run_workers("warm_up_model")
+        await self._arun_workers("warm_up_model")
 
     @classmethod
     def from_engine_args(cls, engine_args: EngineArgs) -> "LLMEngine":
@@ -315,6 +330,10 @@ class LLMEngine:
             request_id: The ID(s) of the request to abort.
         """
         self.scheduler.abort_seq_group(request_id)
+
+    def abort_all_requests(self) -> None:
+        """Aborts all requests."""
+        self.scheduler.abort_all_seq_groups()
 
     def get_model_config(self) -> ModelConfig:
         """Gets the model configuration."""
@@ -586,12 +605,15 @@ class LLMEngine:
         and updates the scheduler with the model outputs. Finally, it decodes
         the sequences and returns the newly generated results.
         """
+        return self._run_async(self.astep())
+
+    async def astep(self) -> List[RequestOutput]:
         seq_group_metadata_list, scheduler_outputs, ignored = self._schedule()
         if scheduler_outputs.is_empty():
             return ignored
 
         # Execute the model.
-        output = self._run_workers(
+        output = await self._arun_workers(
             "execute_model",
             seq_group_metadata_list=seq_group_metadata_list,
             blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
@@ -725,7 +747,7 @@ class LLMEngine:
             seq.status = SequenceStatus.FINISHED_STOPPED
             return
 
-    def _run_workers_in_batch(
+    async def _arun_workers_in_batch(
         self,
         workers,
         method: str,
@@ -742,10 +764,10 @@ class LLMEngine:
             output = executor(*args, **kwargs)
             all_outputs.append(output)
         if self.parallel_config.worker_use_ray:
-            all_outputs = ray.get(all_outputs)
+            all_outputs = await asyncio.gather(*all_outputs)
         return all_outputs
 
-    def _run_workers(
+    async def _arun_workers(
         self,
         method: str,
         *args,
@@ -754,7 +776,7 @@ class LLMEngine:
         **kwargs,
     ) -> Any:
         """Runs the given method on all workers."""
-        all_outputs = []
+        all_outputs: List[asyncio.Future] = []
         if max_concurrent_workers:
             work_groups = [
                 self.workers[i:i + max_concurrent_workers]
@@ -764,8 +786,10 @@ class LLMEngine:
             work_groups = [self.workers]
 
         for workers in work_groups:
-            all_outputs.extend(
-                self._run_workers_in_batch(workers, method, *args, **kwargs))
+            all_outputs.append(
+                self._arun_workers_in_batch(workers, method, *args, **kwargs))
+
+        all_outputs = sum(await asyncio.gather(*all_outputs), [])
 
         if get_all_outputs:
             return all_outputs
